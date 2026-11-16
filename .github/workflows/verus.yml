@@ -1,0 +1,64 @@
+name: Verus same-source kernels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          persist-credentials: false
+      - name: Install pinned Verus and compiler
+        shell: pwsh
+        run: |
+          $url = 'https://github.com/verus-lang/verus/releases/download/release/0.2026.11.02.8bf68ee/verus-0.2026.11.02.8bf68ee-x86-win.zip'
+          $zip = Join-Path $env:RUNNER_TEMP 'verus.zip'
+          Invoke-WebRequest $url -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne '221F471D5925C4B55362CBD20A1BB15333338962902C2283B3F2B4D4C8930456') {
+            throw 'Verus archive digest mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          $bin = Join-Path $env:RUNNER_TEMP 'verus-x86-win'
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append
+          "VERUS_Z3_PATH=$bin\z3.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          rustup toolchain install 1.99.1 --profile minimal --component rustc-dev,llvm-tools
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify actual source, lifetime checks enabled
+        shell: pwsh
+        run: |
+          verus --version
+          & $env:VERUS_Z3_PATH --version
+          .\verus\verify.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Check executable and proof failure propagation
+        shell: pwsh
+        run: .\verus\check-negative-controls.ps1
+      - name: Ordinary Rust regressions
+        shell: pwsh
+        run: |
+          cargo +1.99.1 test -p zlib-rs --lib --features __internal-api --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo +1.99.1 test -p libz-rs-sys --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Retain proof and control transcripts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: same-source-proof-evidence
+          path: |
+            verus/target/acceptance-*/evidence.json
+            verus/target/acceptance-*/stdout.log
+            verus/target/acceptance-*/stderr.log
+            verus/target/acceptance-*/source/**
+            verus/target/controls-*/results.json
+            verus/target/controls-*/baseline-source-sha256.json
+            verus/target/controls-*/baseline/**
+            verus/target/controls-*/*/stdout.log
+            verus/target/controls-*/*/stderr.log

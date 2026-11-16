@@ -1,4 +1,9 @@
-use super::braid::CRC32_LSB_POLY;
+use super::constants::CRC32_LSB_POLY;
+
+#[cfg(verus_keep_ghost)]
+use crate::{crc_proofs, crc_specs};
+#[cfg(verus_keep_ghost)]
+use vstd::prelude::*;
 
 pub const fn crc32_combine(crc1: u32, crc2: u32, len2: u64) -> u32 {
     crc32_combine_op(crc1, crc2, crc32_combine_gen(len2))
@@ -10,6 +15,9 @@ pub const fn crc32_combine_gen(len2: u64) -> u32 {
 }
 
 #[inline(always)]
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures result == crc_specs::product(op, crc1) ^ crc2,
+))]
 pub const fn crc32_combine_op(crc1: u32, crc2: u32, op: u32) -> u32 {
     multmodp(op, crc1) ^ crc2
 }
@@ -22,17 +30,72 @@ const X2N_TABLE: [u32; 32] = [
 ];
 
 // Return a(x) multiplied by b(x) modulo p(x), where p(x) is the CRC polynomial,
-// reflected. For speed, this requires that a not be zero.
-pub(crate) const fn multmodp(a: u32, mut b: u32) -> u32 {
+// reflected. Zero is accepted, including through the public combine-op API.
+#[cfg_attr(verus_keep_ghost, verifier::loop_isolation(false))]
+#[cfg_attr(verus_keep_ghost, verus_spec(result =>
+    ensures result == crc_specs::product(a, initial_b),
+))]
+pub(crate) const fn multmodp(a: u32, initial_b: u32) -> u32 {
+    let mut b = initial_b;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        crc_proofs::bit_identities(a);
+        assert(crc_specs::remaining_mask(0) == u32::MAX) by (compute);
+    }
+    if a == 0 {
+        #[cfg(verus_keep_ghost)]
+        proof! { crc_proofs::zero_terms(a, b, 0); }
+        return 0;
+    }
     let mut m = 1 << 31;
     let mut p = 0;
+    #[cfg(verus_keep_ghost)]
+    proof! {
+        crc_proofs::bit_identities(crc_specs::product(a, initial_b));
+        assert(crc_specs::coefficient_mask(0) == 0x8000_0000u32) by (compute);
+        assert(m == 0x8000_0000u32) by (bit_vector) requires m == 1u32 << 31;
+        assert(crc_proofs::multiplication_at(a, initial_b, m, p, b, 0));
+    }
 
-    loop {
+    #[cfg_attr(verus_keep_ghost, verus_spec(
+        invariant crc_proofs::multiplication_state(a, initial_b, m, p, b),
+        decreases m,
+    ))]
+    while m != 0 {
+        #[cfg(verus_keep_ghost)]
+        proof_decl! {
+            let ghost steps = choose|i: nat|
+                crc_proofs::multiplication_at(a, initial_b, m, p, b, i);
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crc_proofs::unfold_term(a, initial_b, steps);
+            crc_proofs::bit_identities(crc_specs::product_terms(a, initial_b, steps + 1));
+        }
         if (a & m) != 0 {
+            #[cfg(verus_keep_ghost)]
+            proof! {
+                crc_proofs::xor_reassociate(p, b,
+                    crc_specs::product_terms(a, initial_b, steps + 1));
+            }
             p ^= b;
             if (a & (m - 1)) == 0 {
-                break;
+                #[cfg(verus_keep_ghost)]
+                proof! {
+                    crc_proofs::lower_mask(steps as u32);
+                    crc_proofs::zero_terms(a, initial_b, steps + 1);
+                    crc_proofs::bit_identities(p);
+                }
+                return p;
             }
+        }
+        #[cfg(verus_keep_ghost)]
+        proof! {
+            crc_proofs::next_mask(steps as u32);
+            crc_proofs::shift_step(initial_b, steps);
+            assert((m >> 1) < m) by (bit_vector) requires m > 0;
+            assert(crc_proofs::multiplication_at(a, initial_b, m >> 1, p,
+                crc_specs::times_x(b), steps + 1));
         }
         m >>= 1;
         b = if (b & 1) != 0 {
@@ -42,6 +105,8 @@ pub(crate) const fn multmodp(a: u32, mut b: u32) -> u32 {
         };
     }
 
+    #[cfg(verus_keep_ghost)]
+    proof! { crc_proofs::finish_multiplication(a, initial_b, m, p, b); }
     p
 }
 
@@ -65,6 +130,24 @@ mod test {
     use super::*;
 
     use crate::crc32::crc32;
+
+    #[test]
+    fn zero_crc_operator_is_total() {
+        for first in [0, 1, 0x1234_5678, u32::MAX] {
+            for second in [0, 1, 0x9abc_def0, u32::MAX] {
+                assert_eq!(crc32_combine_op(first, second, 0), second);
+            }
+        }
+    }
+
+    #[test]
+    fn identity_crc_operator() {
+        for first in [0, 1, 0x1234_5678, u32::MAX] {
+            for second in [0, 1, 0x9abc_def0, u32::MAX] {
+                assert_eq!(crc32_combine_op(first, second, 0x8000_0000), first ^ second);
+            }
+        }
+    }
 
     #[test]
     fn test_crc32_combine() {

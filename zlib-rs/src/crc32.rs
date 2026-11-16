@@ -5,11 +5,14 @@ use crate::CRC32_INITIAL_VALUE;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod acle;
 mod braid;
+mod byte;
 mod combine;
+mod constants;
 #[cfg(target_arch = "loongarch64")]
 mod loongarch;
 #[cfg(target_arch = "x86_64")]
 mod pclmulqdq;
+mod tables;
 #[cfg(target_arch = "x86_64")]
 #[cfg(feature = "vpclmulqdq")]
 mod vpclmulqdq;

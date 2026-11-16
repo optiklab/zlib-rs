@@ -8,11 +8,14 @@ mod avx512;
 #[cfg(feature = "avx512")]
 #[cfg(target_arch = "x86_64")]
 mod avx512_vnni;
+mod combine;
+mod constants;
 mod generic;
 #[cfg(all(target_arch = "loongarch64", feature = "lsx"))]
 mod lsx;
 #[cfg(target_arch = "aarch64")]
 mod neon;
+mod short;
 #[cfg(any(target_arch = "wasm32", target_arch = "wasm64"))]
 mod wasm;
 
@@ -55,36 +58,7 @@ pub(crate) fn adler32_fold_copy(start_checksum: u32, dst: &mut [u8], src: &[u8])
     adler32(start_checksum, src)
 }
 
-pub fn adler32_combine(adler1: u32, adler2: u32, len2: u64) -> u32 {
-    const BASE: u64 = self::BASE as u64;
-
-    let rem = len2 % BASE;
-
-    let adler1 = adler1 as u64;
-    let adler2 = adler2 as u64;
-
-    /* the derivation of this formula is left as an exercise for the reader */
-    let mut sum1 = adler1 & 0xffff;
-    let mut sum2 = rem * sum1;
-    sum2 %= BASE;
-    sum1 += (adler2 & 0xffff) + BASE - 1;
-    sum2 += ((adler1 >> 16) & 0xffff) + ((adler2 >> 16) & 0xffff) + BASE - rem;
-
-    if sum1 >= BASE {
-        sum1 -= BASE;
-    }
-    if sum1 >= BASE {
-        sum1 -= BASE;
-    }
-    if sum2 >= (BASE << 1) {
-        sum2 -= BASE << 1;
-    }
-    if sum2 >= BASE {
-        sum2 -= BASE;
-    }
-
-    (sum1 | (sum2 << 16)) as u32
-}
+pub use combine::adler32_combine;
 
 // inefficient but correct, useful for testing
 #[cfg(test)]
@@ -102,12 +76,76 @@ fn naive_adler32(start_checksum: u32, data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
-const BASE: u32 = 65521; /* largest prime smaller than 65536 */
-const NMAX: u32 = 5552;
+use constants::{BASE, NMAX};
 
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn independent_adler_vectors() {
+        // Frozen outputs from CPython 3.11.9's native zlib 1.3.1.
+        for (input, expected) in [
+            (&b""[..], 1),
+            (&b"Wikipedia"[..], 0x11e6_0398),
+            (&b"123456789"[..], 0x091e_01de),
+        ] {
+            assert_eq!(generic::adler32_rust(1, input), expected);
+            assert_eq!(adler32(1, input), expected);
+        }
+
+        for (len, expected) in [
+            (15, 0x7797_0ef2),
+            (16, 0x8788_0ff1),
+            (17, 0x9878_10f0),
+            (5551, 0x5603_9a8d),
+            (5552, 0xf18f_9b8c),
+            (5553, 0x8e29_9c8b),
+            (11104, 0xff6f_3726),
+            (11105, 0x37a3_3825),
+        ] {
+            let input = vec![255; len];
+            assert_eq!(generic::adler32_rust(1, &input), expected, "len={len}");
+            assert_eq!(adler32(1, &input), expected, "len={len}");
+        }
+    }
+
+    #[test]
+    fn scalar_seed_and_reduction_boundaries() {
+        for start in [0, 1, 42, 0x0000_ffff, 0xffff_0000, u32::MAX] {
+            for len in [
+                0, 1, 7, 8, 15, 16, 17, 31, 32, 63, 64, 65, 5551, 5552, 5553, 11104, 11105,
+            ] {
+                for byte in [0, 255] {
+                    let input = vec![byte; len];
+                    let expected = naive_adler32(start, &input);
+                    assert_eq!(
+                        generic::adler32_rust(start, &input),
+                        expected,
+                        "start={start:#x}, len={len}, byte={byte}"
+                    );
+                    assert_eq!(adler32(start, &input), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_chunk_and_combine_composition() {
+        let input: Vec<u8> = (0..11105).map(|i| (i * 197 + 101) as u8).collect();
+        let expected = generic::adler32_rust(1, &input);
+        for split in [0, 1, 15, 16, 17, 5551, 5552, 5553, 11104, 11105] {
+            let (left, right) = input.split_at(split);
+            let first = generic::adler32_rust(1, left);
+            let second = generic::adler32_rust(1, right);
+            assert_eq!(generic::adler32_rust(first, right), expected);
+            assert_eq!(adler32_combine(first, second, right.len() as u64), expected);
+        }
+        for chunk_size in [1, 7, 8, 15, 16, 17, 5552, 5553] {
+            let result = input.chunks(chunk_size).fold(1, generic::adler32_rust);
+            assert_eq!(result, expected, "chunk_size={chunk_size}");
+        }
+    }
 
     #[test]
     fn naive_is_fancy_small_inputs() {

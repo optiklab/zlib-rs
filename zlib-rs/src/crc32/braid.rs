@@ -5,11 +5,9 @@
 //   at a time, based on the algorithm in section 4.11 from
 //   https://github.com/zlib-ng/zlib-ng/blob/develop/doc/crc-doc.1.0.pdf.
 
-// The binary encoding of the CRC-32 polynomial.
-// We are assuming little-endianness so we process the input
-// LSB-first. We need to use the "reversed" value from e.g
-// https://en.wikipedia.org/wiki/Cyclic_redundancy_check#Polynomial_representations.
-pub(crate) const CRC32_LSB_POLY: usize = 0xedb8_8320usize;
+use super::byte::crc32_naive_inner;
+pub(crate) use super::byte::get_crc_table;
+use super::tables::build_crc32_table;
 
 const W: usize = core::mem::size_of::<usize>();
 
@@ -19,14 +17,8 @@ const _: () = assert!(W >= core::mem::size_of::<u32>());
 
 // Pre-computed tables for the CRC32 algorithm.
 // CRC32_BYTE_TABLE corresponds to MulByXPowD from the paper.
-static CRC32_BYTE_TABLE: [[u32; 256]; 1] = build_crc32_table::<256, 1, 1>();
 // CRC32_WORD_TABLE is MulWordByXpowD.
 static CRC32_WORD_TABLE: [[u32; 256]; W] = build_crc32_table::<256, W, 1>();
-
-// FIXME: make const fn when msrv allows.
-pub(crate) fn get_crc_table() -> &'static [u32; 256] {
-    &CRC32_BYTE_TABLE[0]
-}
 
 // Work-around for not being able to define generic consts or statics
 // Crc32BraidTable::<N>::TABLE is the generic table for any braid size N.
@@ -34,42 +26,6 @@ struct Crc32BraidTable<const N: usize>;
 
 impl<const N: usize> Crc32BraidTable<N> {
     const TABLE: [[u32; 256]; W] = build_crc32_table::<256, W, N>();
-}
-
-// Build the CRC32 tables using a more efficient and simpler approach
-// than the combination of Multiply and XpowN (which implement polynomial
-// multiplication and exponentiation, respectively) from the paper,
-// but with identical results. This function is const, so it should be
-// fully evaluated at compile time.
-const fn build_crc32_table<const A: usize, const W: usize, const N: usize>() -> [[u32; A]; W] {
-    let mut arr = [[0u32; A]; W];
-    let mut i = 0;
-    while i < W {
-        let mut j = 0;
-        while j < A {
-            let mut c = j;
-            let mut k = 0;
-            while k < 8 * (W * N - i) {
-                if c & 1 != 0 {
-                    c = CRC32_LSB_POLY ^ (c >> 1);
-                } else {
-                    c >>= 1;
-                }
-                k += 1;
-            }
-            arr[i][j] = c as u32;
-            j += 1;
-        }
-        i += 1;
-    }
-    arr
-}
-
-fn crc32_naive_inner(data: &[u8], start: u32) -> u32 {
-    data.iter().fold(start, |crc, val| {
-        let crc32_lsb = crc.to_le_bytes()[0];
-        CRC32_BYTE_TABLE[0][usize::from(crc32_lsb ^ *val)] ^ (crc >> 8)
-    })
 }
 
 fn crc32_words_inner(words: &[usize], start: u32, per_word_crcs: &[u32]) -> u32 {

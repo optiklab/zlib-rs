@@ -7,6 +7,8 @@ use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 
 mod bitreader;
+mod header_lengths;
+mod header_state;
 mod infback;
 mod inffixed_tbl;
 mod inftrees;
@@ -25,11 +27,13 @@ use crate::{
 
 use crate::crc32::{crc32, Crc32Fold};
 
+pub use self::header_state::Mode;
 pub use self::infback::{back, back_end, back_init};
 pub use self::window::Window;
 use self::{
     bitreader::BitReader,
-    inftrees::{inflate_table, CodeType, InflateTable},
+    header_state::{Codes, HeaderAction, Table},
+    inftrees::{inflate_completed_distance_table, inflate_completed_literal_table, InflateTable},
 };
 
 const INFLATE_STRICT: bool = false;
@@ -283,58 +287,6 @@ pub fn uncompress2<'a>(
     (consumed, output_slice, ret)
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum Mode {
-    Head,
-    Flags,
-    Time,
-    Os,
-    ExLen,
-    Extra,
-    Name,
-    Comment,
-    HCrc,
-    Sync,
-    Mem,
-    Length,
-    Type,
-    TypeDo,
-    Stored,
-    CopyBlock,
-    Check,
-    Len_,
-    Len,
-    Lit,
-    LenExt,
-    Dist,
-    DistExt,
-    Match,
-    Table,
-    LenLens,
-    CodeLens,
-    DictId,
-    Dict,
-    Done,
-    Bad,
-}
-
-#[derive(Default, Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
-enum Codes {
-    #[default]
-    Fixed,
-    Codes,
-    Len,
-    Dist,
-}
-
-#[derive(Default, Clone, Copy)]
-struct Table {
-    codes: Codes,
-    bits: usize,
-}
-
 #[derive(Clone, Copy)]
 struct Flags(u8);
 
@@ -521,7 +473,7 @@ impl<'a> State<'a> {
 
     fn len_table_ref(&self) -> &[Code] {
         match self.len_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::LENFIX,
+            Codes::Fixed => self::inffixed_tbl::fixed_literal_table(),
             Codes::Codes => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
@@ -530,7 +482,7 @@ impl<'a> State<'a> {
 
     fn dist_table_ref(&self) -> &[Code] {
         match self.dist_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::DISTFIX,
+            Codes::Fixed => self::inffixed_tbl::fixed_distance_table(),
             Codes::Codes => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
@@ -568,8 +520,11 @@ impl State<'_> {
         let avail_in = self.bit_reader.bytes_remaining();
         let avail_out = self.writer.remaining();
 
-        if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
-            // SAFETY: INFLATE_FAST_MIN_HAVE is enough bytes remaining to satisfy the precondition.
+        if avail_in >= INFLATE_FAST_MIN_HAVE
+            && avail_out >= INFLATE_FAST_MIN_LEFT
+            && self.bit_reader.bits_in_buffer() < 8
+        {
+            // SAFETY: enough input remains, and cleanup cannot rewind pre-existing whole bytes.
             unsafe { inflate_fast_help(self, 0) };
             match self.mode {
                 Mode::Len => {}
@@ -600,14 +555,14 @@ impl State<'_> {
         load!();
 
         let len_table = match self.len_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::LENFIX[..],
+            Codes::Fixed => &self::inffixed_tbl::fixed_literal_table()[..],
             Codes::Codes => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
         };
 
         let dist_table = match self.dist_table.codes {
-            Codes::Fixed => &self::inffixed_tbl::DISTFIX[..],
+            Codes::Fixed => &self::inffixed_tbl::fixed_distance_table()[..],
             Codes::Codes => &self.codes_codes,
             Codes::Len => &self.len_codes,
             Codes::Dist => &self.dist_codes,
@@ -624,9 +579,12 @@ impl State<'_> {
                         // space available. This means for many SIMD operations we don't need to process a
                         // remainder; we just copy blindly, and a later operation will overwrite the extra copied
                         // bytes
-                        if avail_in >= INFLATE_FAST_MIN_HAVE && avail_out >= INFLATE_FAST_MIN_LEFT {
+                        if avail_in >= INFLATE_FAST_MIN_HAVE
+                            && avail_out >= INFLATE_FAST_MIN_LEFT
+                            && bit_reader.bits_in_buffer() < 8
+                        {
                             restore!();
-                            // SAFETY: INFLATE_FAST_MIN_HAVE >= 15.
+                            // SAFETY: INFLATE_FAST_MIN_HAVE >= 15 and the buffer holds no whole byte.
                             // Note that the restore macro does not do anything that would
                             // reduce the number of bytes available.
                             unsafe { inflate_fast_help(self, 0) };
@@ -638,8 +596,11 @@ impl State<'_> {
                         // get a literal, length, or end-of-block code
                         let mut here;
                         loop {
-                            let bits = bit_reader.bits(self.len_table.bits);
-                            here = len_table[bits as usize];
+                            here = inftrees::lookup_root_entry(
+                                len_table,
+                                self.len_table.bits,
+                                bit_reader.hold(),
+                            );
 
                             if here.bits <= bit_reader.bits_in_buffer() {
                                 break;
@@ -745,8 +706,11 @@ impl State<'_> {
                         // get distance code
                         let mut here;
                         loop {
-                            let bits = bit_reader.bits(self.dist_table.bits) as usize;
-                            here = dist_table[bits];
+                            here = inftrees::lookup_root_entry(
+                                dist_table,
+                                self.dist_table.bits,
+                                bit_reader.hold(),
+                            );
                             if here.bits <= bit_reader.bits_in_buffer() {
                                 break;
                             }
@@ -761,9 +725,9 @@ impl State<'_> {
                             let last = here;
 
                             loop {
-                                let bits = bit_reader.bits((last.bits + last.op) as usize);
-                                here =
-                                    dist_table[last.val as usize + ((bits as usize) >> last.bits)];
+                                let index =
+                                    inftrees::lookup_subtable_index(bit_reader.hold(), last);
+                                here = dist_table[index];
 
                                 if last.bits + here.bits <= bit_reader.bits_in_buffer() {
                                     break;
@@ -1488,10 +1452,9 @@ impl State<'_> {
                             let last = here;
 
                             loop {
-                                let bits = self.bit_reader.bits((last.bits + last.op) as usize);
-                                here = self.dist_table_get(
-                                    last.val as usize + ((bits as usize) >> last.bits),
-                                );
+                                let index =
+                                    inftrees::lookup_subtable_index(self.bit_reader.hold(), last);
+                                here = self.dist_table_get(index);
 
                                 if last.bits + here.bits <= self.bit_reader.bits_in_buffer() {
                                     break;
@@ -1601,147 +1564,34 @@ impl State<'_> {
                             }
                         }
                     }
-                    Mode::Table => {
-                        need_bits!(self, 14);
-                        self.nlen = self.bit_reader.bits(5) as usize + 257;
-                        self.bit_reader.drop_bits(5);
-                        self.ndist = self.bit_reader.bits(5) as usize + 1;
-                        self.bit_reader.drop_bits(5);
-                        self.ncode = self.bit_reader.bits(4) as usize + 4;
-                        self.bit_reader.drop_bits(4);
-
-                        // TODO pkzit_bug_workaround
-                        if self.nlen > 286 || self.ndist > 30 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("too many length or distance symbols\0");
-                        }
-
-                        self.have = 0;
-
-                        break 'blk Mode::LenLens;
-                    }
-                    Mode::LenLens => {
-                        // permutation of code lengths ;
-                        const ORDER: [u8; 19] = [
-                            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-                        ];
-
-                        while self.have < self.ncode {
-                            need_bits!(self, 3);
-                            self.lens[usize::from(ORDER[self.have])] =
-                                self.bit_reader.bits(3) as u16;
-                            self.have += 1;
-                            self.bit_reader.drop_bits(3);
-                        }
-
-                        while self.have < 19 {
-                            self.lens[usize::from(ORDER[self.have])] = 0;
-                            self.have += 1;
-                        }
-
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Codes,
-                            &self.lens[..19],
+                    Mode::Table | Mode::LenLens | Mode::CodeLens => {
+                        let action = self.bit_reader.read_header_state(
+                            &mut mode,
+                            &mut self.nlen,
+                            &mut self.ndist,
+                            &mut self.ncode,
+                            &mut self.len_table,
+                            &mut self.next,
+                            &mut self.lens,
+                            &mut self.have,
                             &mut self.codes_codes,
-                            7,
                             &mut self.work,
-                        ) else {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid code lengths set\0");
-                        };
-
-                        self.next = used;
-                        self.len_table.codes = Codes::Codes;
-                        self.len_table.bits = root;
-
-                        self.have = 0;
-
-                        break 'blk Mode::CodeLens;
-                    }
-                    Mode::CodeLens => {
-                        while self.have < self.nlen + self.ndist {
-                            let here = loop {
-                                let bits = self.bit_reader.bits(self.len_table.bits);
-                                let here = self.len_table_get(bits as usize);
-                                if here.bits <= self.bit_reader.bits_in_buffer() {
-                                    break here;
-                                }
-
-                                pull_byte!(self);
-                            };
-
-                            let here_bits = here.bits;
-
-                            match here.val {
-                                0..=15 => {
-                                    self.bit_reader.drop_bits(here_bits);
-                                    self.lens[self.have] = here.val;
-                                    self.have += 1;
-                                }
-                                16 => {
-                                    need_bits!(self, usize::from(here_bits) + 2);
-                                    self.bit_reader.drop_bits(here_bits);
-                                    if self.have == 0 {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    let len = self.lens[self.have - 1];
-                                    let copy = 3 + self.bit_reader.bits(2) as usize;
-                                    self.bit_reader.drop_bits(2);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(len);
-                                    self.have += copy;
-                                }
-                                17 => {
-                                    need_bits!(self, usize::from(here_bits) + 3);
-                                    self.bit_reader.drop_bits(here_bits);
-                                    let copy = 3 + self.bit_reader.bits(3) as usize;
-                                    self.bit_reader.drop_bits(3);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
-                                }
-                                18.. => {
-                                    need_bits!(self, usize::from(here_bits) + 7);
-                                    self.bit_reader.drop_bits(here_bits);
-                                    let copy = 11 + self.bit_reader.bits(7) as usize;
-                                    self.bit_reader.drop_bits(7);
-
-                                    if self.have + copy > self.nlen + self.ndist {
-                                        mode = Mode::Bad;
-                                        break 'label self.bad("invalid bit length repeat\0");
-                                    }
-
-                                    self.lens[self.have..][..copy].fill(0);
-                                    self.have += copy;
-                                }
-                            }
+                        );
+                        if let Some(message) = action.error_message() {
+                            break 'label self.bad(message);
                         }
-
-                        // check for end-of-block code (better have one)
-                        if self.lens[256] == 0 {
-                            mode = Mode::Bad;
-                            break 'label self.bad("invalid code -- missing end-of-block\0");
+                        if action == HeaderAction::NeedInput {
+                            self.mode = mode;
+                            return self.inflate_leave(ReturnCode::Ok);
                         }
 
                         // build code tables
 
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Lens,
-                            &self.lens[..self.nlen],
+                        let InflateTable::Success { root, used } = inflate_completed_literal_table(
+                            &self.lens,
+                            self.nlen,
+                            self.ndist,
                             &mut self.len_codes,
-                            10,
                             &mut self.work,
                         ) else {
                             mode = Mode::Bad;
@@ -1752,11 +1602,11 @@ impl State<'_> {
                         self.len_table.bits = root;
                         self.next = used;
 
-                        let InflateTable::Success { root, used } = inflate_table(
-                            CodeType::Dists,
-                            &self.lens[self.nlen..][..self.ndist],
+                        let InflateTable::Success { root, used } = inflate_completed_distance_table(
+                            &self.lens,
+                            self.nlen,
+                            self.ndist,
                             &mut self.dist_codes,
-                            9,
                             &mut self.work,
                         ) else {
                             mode = Mode::Bad;
@@ -1877,6 +1727,7 @@ impl State<'_> {
 ///
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
+/// and fewer than eight buffered bits.
 unsafe fn inflate_fast_help(state: &mut State, start: usize) {
     #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     if crate::cpu_features::is_enabled_avx2_and_bmi2() {
@@ -1892,6 +1743,7 @@ unsafe fn inflate_fast_help(state: &mut State, start: usize) {
 ///
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
+/// and fewer than eight buffered bits.
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 #[target_feature(enable = "avx2")]
 #[target_feature(enable = "bmi2")]
@@ -1905,6 +1757,7 @@ unsafe fn inflate_fast_help_avx2(state: &mut State, start: usize) {
 ///
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
+/// and fewer than eight buffered bits.
 unsafe fn inflate_fast_help_vanilla(state: &mut State, start: usize) {
     // SAFETY: `bytes_remaining` checked by our caller
     unsafe { inflate_fast_help_impl::<{ CpuFeatures::NONE }>(state, start) };
@@ -1914,11 +1767,13 @@ unsafe fn inflate_fast_help_vanilla(state: &mut State, start: usize) {
 ///
 /// `state.bit_reader` must have at least 15 bytes available to read, as
 /// indicated by `state.bit_reader.bytes_remaining() >= 15`
+/// and fewer than eight buffered bits.
 #[inline(always)]
 unsafe fn inflate_fast_help_impl<const FEATURES: usize>(state: &mut State, _start: usize) {
     let mut bit_reader = BitReader::new(&[]);
     core::mem::swap(&mut bit_reader, &mut state.bit_reader);
     debug_assert!(bit_reader.bytes_remaining() >= 15);
+    debug_assert!(bit_reader.bits_in_buffer() < 8);
 
     let mut writer = Writer::new(&mut []);
     core::mem::swap(&mut writer, &mut state.writer);
@@ -2490,8 +2345,12 @@ pub fn sync(stream: &mut InflateStream) -> ReturnCode {
     }
 
     // search available input
-    // SAFETY: user guarantees that pointer and length are valid.
-    let slice = unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) };
+    let slice = if stream.avail_in == 0 {
+        &[]
+    } else {
+        // SAFETY: user guarantees that pointer and length are valid.
+        unsafe { core::slice::from_raw_parts(stream.next_in, stream.avail_in as usize) }
+    };
 
     let len;
     (state.have, len) = syncsearch(state.have, slice);
@@ -2713,6 +2572,163 @@ pub unsafe fn get_dictionary(stream: &InflateStream<'_>, dictionary: *mut u8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_metadata_survives_suspension_and_empty_retries() {
+        for fixture in [
+            [0x05u8, 0xc0, 0x81, 0x08, 0, 0, 0, 0, 0x20, 0x7f, 0xeb, 0x07],
+            [0x05u8, 0xc1, 0x85, 0x00, 0, 0, 0, 0, 0x20, 0x7f, 0xea, 0x26],
+        ] {
+            for split in 1..fixture.len() {
+                let mut output = [0xa5u8];
+                let mut stream = InflateStream::new(InflateConfig { window_bits: -15 });
+                stream.state.nlen = 400;
+                stream.state.ndist = 401;
+                stream.state.ncode = 402;
+                stream.state.have = 99;
+                stream.state.next = 77;
+                stream.state.len_table = Table {
+                    codes: Codes::Dist,
+                    bits: 42,
+                };
+                stream.next_in = fixture.as_ptr().cast_mut();
+                stream.avail_in = split as u32;
+                stream.next_out = output.as_mut_ptr();
+                stream.avail_out = 1;
+                // SAFETY: the configured input and output buffers remain live.
+                assert_eq!(
+                    unsafe { inflate(&mut stream, InflateFlush::NoFlush) },
+                    ReturnCode::Ok
+                );
+                let snapshot = |state: &State<'_>| {
+                    (
+                        state.mode as u8,
+                        (state.nlen, state.ndist, state.ncode, state.have, state.next),
+                        (state.len_table.codes as u8, state.len_table.bits),
+                        state.lens,
+                        state.codes_codes,
+                        state.work,
+                    )
+                };
+                match stream.state.mode {
+                    Mode::Table => {
+                        assert_eq!(
+                            (stream.state.nlen, stream.state.ndist, stream.state.ncode),
+                            (400, 401, 402)
+                        );
+                        assert_eq!(stream.state.have, 99);
+                    }
+                    Mode::LenLens => assert!(stream.state.have < stream.state.ncode),
+                    Mode::CodeLens => {
+                        assert!(matches!(stream.state.len_table.codes, Codes::Codes));
+                        assert!((1..=7).contains(&stream.state.len_table.bits));
+                        assert!(stream.state.next <= stream.state.codes_codes.len());
+                    }
+                    other => panic!("unexpected suspended mode: {other:?}"),
+                }
+                let before = snapshot(stream.state);
+                stream.next_in = core::ptr::null_mut();
+                assert_eq!(stream.avail_in, 0);
+                // SAFETY: null input has zero length; the output buffer remains live.
+                assert_eq!(
+                    unsafe { inflate(&mut stream, InflateFlush::NoFlush) },
+                    ReturnCode::BufError
+                );
+                assert_eq!(snapshot(stream.state), before);
+                stream.next_in = fixture[split..].as_ptr().cast_mut();
+                stream.avail_in = (fixture.len() - split) as u32;
+                // SAFETY: both configured buffers remain live through the call.
+                assert_eq!(
+                    unsafe { inflate(&mut stream, InflateFlush::NoFlush) },
+                    ReturnCode::StreamEnd
+                );
+                assert!(matches!(stream.state.len_table.codes, Codes::Len));
+                assert!(matches!(stream.state.dist_table.codes, Codes::Dist));
+                assert_eq!((stream.avail_in, stream.total_in), (0, 12));
+                assert_eq!((stream.total_out, output), (0, [0xa5]));
+                end(&mut stream);
+            }
+        }
+    }
+
+    #[test]
+    fn header_rejections_persist_bad_mode_and_exact_error() {
+        let invalid_counts = [0xfdu8, 0, 0];
+        // Four code-length fields 1/1/1/0 oversubscribe the code-length alphabet.
+        let invalid_alphabet = (5u32 | (1 << 17) | (1 << 20) | (1 << 23)).to_le_bytes();
+        let invalid_repeat = [0x05u8, 0, 0x82, 0];
+        let mut missing_eob = [0u8; 36];
+        missing_eob[0] = 5;
+        for (input, message) in [
+            (&invalid_counts[..], "too many length or distance symbols\0"),
+            (&invalid_alphabet[..], "invalid code lengths set\0"),
+            (&invalid_repeat[..], "invalid bit length repeat\0"),
+            (&missing_eob[..], "invalid code -- missing end-of-block\0"),
+        ] {
+            let mut output = [0xa5u8];
+            let mut stream = InflateStream::new(InflateConfig { window_bits: -15 });
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input.len() as u32;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = 1;
+            // SAFETY: both configured buffers remain live through the call.
+            assert_eq!(
+                unsafe { inflate(&mut stream, InflateFlush::NoFlush) },
+                ReturnCode::DataError
+            );
+            assert!(matches!(stream.state.mode, Mode::Bad));
+            assert_eq!(stream.state.error_message, Some(message));
+            let consumed = stream.total_in;
+            stream.next_in = core::ptr::null_mut();
+            stream.avail_in = 0;
+            // SAFETY: null input has zero length; the output buffer remains live.
+            assert_eq!(
+                unsafe { inflate(&mut stream, InflateFlush::NoFlush) },
+                ReturnCode::DataError
+            );
+            assert!(matches!(stream.state.mode, Mode::Bad));
+            assert_eq!(
+                stream.state.error_message,
+                Some("repeated call with bad state\0")
+            );
+            assert_eq!(stream.total_in, consumed);
+            assert_eq!((stream.total_out, output), (0, [0xa5]));
+            end(&mut stream);
+        }
+    }
+
+    #[test]
+    fn prime_preserves_input_cursor_after_primed_end_of_block() {
+        for buffered in [10, 17, 18, 24, 32] {
+            let input = [0u8; 32];
+            let mut output = [0u8; 512];
+            let mut stream = InflateStream::new(InflateConfig { window_bits: -15 });
+            // Final fixed block, followed by the seven zero bits encoding end-of-block.
+            assert_eq!(prime(&mut stream, buffered.min(16), 3), ReturnCode::Ok);
+            if buffered > 16 {
+                assert_eq!(prime(&mut stream, buffered - 16, 0), ReturnCode::Ok);
+            }
+            stream.next_in = input.as_ptr().cast_mut();
+            stream.avail_in = input.len() as u32;
+            stream.next_out = output.as_mut_ptr();
+            stream.avail_out = output.len() as u32;
+            // SAFETY: both configured buffers remain alive and meet their stated lengths.
+            let result = unsafe { inflate(&mut stream, InflateFlush::NoFlush) };
+            let next_in = stream.next_in;
+            let avail_in = stream.avail_in;
+            let total_in = stream.total_in;
+            let total_out = stream.total_out;
+            end(&mut stream);
+            assert_eq!(result, ReturnCode::StreamEnd, "primed bits: {buffered}");
+            assert_eq!(
+                next_in,
+                input.as_ptr().cast_mut(),
+                "primed bits: {buffered}"
+            );
+            assert_eq!(avail_in, input.len() as u32, "primed bits: {buffered}");
+            assert_eq!((total_in, total_out), (0, 0), "primed bits: {buffered}");
+        }
+    }
 
     #[test]
     fn uncompress_buffer_overflow() {

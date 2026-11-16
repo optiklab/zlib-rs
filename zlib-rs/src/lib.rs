@@ -32,9 +32,14 @@ cfg_select! {
     }
 }
 
+mod code;
 mod cpu_features;
 mod stable;
+mod table_constants;
 mod weak_slice;
+
+pub(crate) use code::Code;
+pub(crate) use table_constants::{ENOUGH_DISTS, ENOUGH_LENS};
 
 pub use stable::{Deflate, DeflateError, Inflate, InflateError, Status};
 
@@ -98,8 +103,6 @@ use cfg_select;
 /// updated.
 #[allow(unused)]
 pub(crate) const ENOUGH: usize = ENOUGH_LENS + ENOUGH_DISTS;
-pub(crate) const ENOUGH_LENS: usize = 1332;
-pub(crate) const ENOUGH_DISTS: usize = 592;
 
 /// initial adler-32 hash value
 pub(crate) const ADLER32_INITIAL_VALUE: usize = 1;
@@ -209,16 +212,6 @@ impl TryFrom<i32> for InflateFlush {
             _ => Err(()),
         }
     }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Code {
-    /// operation, extra bits, table bits
-    pub op: u8,
-    /// bits in this part of the code
-    pub bits: u8,
-    /// offset in table or code value
-    pub val: u16,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
